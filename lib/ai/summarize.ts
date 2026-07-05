@@ -24,25 +24,47 @@ const MAX_CONTENT_CHARS = 6000;
 function buildPrompt(rawContent: string): string {
   const content = rawContent.slice(0, MAX_CONTENT_CHARS);
   return `Bạn là chuyên gia phân tích luật C&B tại Việt Nam.
-Phân tích văn bản sau và trả về JSON DUY NHẤT (không giải thích):
+Phân tích văn bản sau và trả về JSON DUY NHẤT (không giải thích, không markdown code block).
+Điền đúng theo mẫu bên dưới, thay các chỗ <...> bằng giá trị thật, GIỮ NGUYÊN
+các dấu ngoặc/dấu phẩy:
 
 {
-  "category": "BHXH|BHYT|BHTN|LUONG|THUE|LAODONG|OTHER",
-  "summary": "2-3 câu tóm tắt bằng tiếng Việt, tập trung tác động thực tế",
-  "highlights": [
-    {"label": "Hiệu lực", "value": "01/07/2026"},
-    {"label": "...", "value": "..."}
-  ],
+  "category": <chọn ĐÚNG 1 từ: BHXH, BHYT, BHTN, LUONG, THUE, LAODONG, OTHER>,
+  "highlights": [ {"label": "<tên ngắn>", "value": "<số liệu thật>"} ],
+  "summary": "<xem hướng dẫn bên dưới>",
   "effective_date": "YYYY-MM-DD hoặc null",
-  "impact": "HIGH|MEDIUM|LOW"
+  "impact": <chọn ĐÚNG 1 từ: HIGH, MEDIUM, LOW>
 }
 
-Impact rules:
-- HIGH: ảnh hưởng trực tiếp lương/BHXH của người lao động
-- MEDIUM: thay đổi thủ tục hoặc mức đóng
-- LOW: hướng dẫn kỹ thuật, thay đổi nhỏ
+QUY TẮC "highlights":
+- Tìm tối đa 5 con số/mốc/điều kiện CỤ THỂ có thật trong văn bản: mức tăng (%),
+  số tiền (đồng), số nghị định/thông tư, ngày hiệu lực, đối tượng áp dụng.
+- BỎ QUA hoàn toàn các ý không có số liệu cụ thể (ví dụ "cải thiện đời sống",
+  "tạo động lực" không đi kèm con số) — thà có 2 mục tốt còn hơn 5 mục có mục
+  chung chung.
+- Nếu văn bản nói nhiều chính sách khác nhau, chỉ giữ các con số của CHÍNH
+  SÁCH quan trọng nhất (tác động nhiều người nhất).
+- Chỉ để mảng rỗng [] nếu văn bản thực sự không chứa con số nào.
 
-Highlights: extract 2-5 con số/ngày/mức quan trọng nhất.
+QUY TẮC "summary":
+- Đúng 1 câu tiếng Việt, PHẢI nhắc lại ít nhất 1 con số đã có trong highlights
+  ở trên (ví dụ "8%", "2.530.000 đồng", "01/07/2026").
+- Không thêm nhận xét cảm tính, không dùng các cụm như "tạo động lực cống
+  hiến", "đảm bảo chất lượng cuộc sống", "nhiều chính sách quan trọng".
+
+Ví dụ TỐT: "Tăng lương hưu và trợ cấp BHXH thêm 8% từ 01/07/2026, người có
+mức hưởng dưới 3.800.000 đồng/tháng được nâng lên bằng mức này."
+Ví dụ XẤU (cấm viết kiểu này): "Điều chỉnh tăng mức tiền lương cơ sở và các
+chính sách nhằm tạo động lực cống hiến cho người lao động."
+
+Impact rules:
+- HIGH: ảnh hưởng trực tiếp lương/BHXH của người lao động. Ví dụ: thay đổi
+  mức lương cơ sở/lương tối thiểu vùng; thay đổi mức giảm trừ gia cảnh thuế
+  TNCN; thay đổi biểu thuế lũy tiến TNCN; thay đổi mức đóng BHXH/BHYT/BHTN.
+- MEDIUM: thay đổi thủ tục hoặc mức đóng. Ví dụ: thay đổi thủ tục quyết toán
+  thuế; bổ sung điều kiện hưởng trợ cấp; hướng dẫn kê khai mới.
+- LOW: hướng dẫn kỹ thuật, thay đổi nhỏ. Ví dụ: cập nhật biểu mẫu; hướng dẫn
+  kỹ thuật nội bộ.
 
 Văn bản:
 ${content}`;
@@ -56,7 +78,14 @@ function extractJSON(text: string): unknown {
   if (start === -1 || end === -1 || end < start) {
     throw new Error("No JSON object found in model response");
   }
-  return JSON.parse(candidate.slice(start, end + 1));
+  const jsonSlice = candidate.slice(start, end + 1);
+  try {
+    return JSON.parse(jsonSlice);
+  } catch {
+    // Small models frequently leave a trailing comma — cheap, common fix
+    // before giving up and paying for a full retry.
+    return JSON.parse(jsonSlice.replace(/,\s*([}\]])/g, "$1"));
+  }
 }
 
 function isHighlightArray(value: unknown): value is Highlight[] {
@@ -99,28 +128,37 @@ interface OpenRouterChatResponse {
   choices?: { message?: { content?: string } }[];
 }
 
+async function requestSummary(rawContent: string): Promise<SummaryResult> {
+  const { data } = await openrouter.post<OpenRouterChatResponse>("/chat/completions", {
+    model: AI_MODEL,
+    max_tokens: 1200,
+    messages: [{ role: "user", content: buildPrompt(rawContent) }],
+  });
+
+  const text = data.choices?.[0]?.message?.content;
+  if (!text) throw new Error("Empty response from model");
+
+  return coerceResult(extractJSON(text));
+}
+
 /**
- * Summarizes and categorizes a raw scraped document via a single OpenRouter
- * chat completion call. Never throws — on any API or parsing failure it logs
- * and returns safe defaults so one bad document can't take down the cron batch.
+ * Summarizes and categorizes a raw scraped document via an OpenRouter chat
+ * completion call. The free model this uses is non-deterministic and
+ * occasionally returns malformed JSON, so a failed attempt is retried once
+ * before giving up. Never throws — on repeated failure it logs and returns
+ * safe defaults so one bad document can't take down the cron batch.
  */
 export async function summarize(rawContent: string): Promise<SummaryResult> {
   if (!rawContent || !rawContent.trim()) return DEFAULT_RESULT;
 
-  try {
-    const { data } = await openrouter.post<OpenRouterChatResponse>("/chat/completions", {
-      model: AI_MODEL,
-      max_tokens: 800,
-      messages: [{ role: "user", content: buildPrompt(rawContent) }],
-    });
-
-    const text = data.choices?.[0]?.message?.content;
-    if (!text) return DEFAULT_RESULT;
-
-    const parsed = extractJSON(text);
-    return coerceResult(parsed);
-  } catch (err) {
-    console.error("[ai:summarize] failed, falling back to defaults:", err);
-    return DEFAULT_RESULT;
+  const MAX_ATTEMPTS = 2;
+  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+    try {
+      return await requestSummary(rawContent);
+    } catch (err) {
+      const nextStep = attempt < MAX_ATTEMPTS ? "retrying" : "falling back to defaults";
+      console.error(`[ai:summarize] attempt ${attempt}/${MAX_ATTEMPTS} failed, ${nextStep}:`, err);
+    }
   }
+  return DEFAULT_RESULT;
 }

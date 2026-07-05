@@ -13,20 +13,53 @@ export interface RawDocument {
 }
 
 export const CB_KEYWORDS = [
-  "BHXH",
-  "bảo hiểm",
-  "lương tối thiểu",
+  // Thuế TNCN
   "thuế TNCN",
-  "lao động",
-  "nghỉ phép",
+  "thuế thu nhập cá nhân",
+  "giảm trừ gia cảnh",
+  "biểu thuế lũy tiến",
+  "khấu trừ thuế",
+  "quyết toán thuế",
+  "TNCN",
+  "thu nhập chịu thuế",
+  "mức giảm trừ",
+
+  // Lương
+  "lương cơ sở",
+  "lương tối thiểu",
+  "lương tối thiểu vùng",
+  "mức lương cơ bản",
+  "hệ số lương",
+  "phụ cấp lương",
+  "Nghị định lương",
+  "tăng lương",
+  "điều chỉnh lương",
+
+  // Existing (BHXH/BHYT/BHTN/lao động)
+  "BHXH",
+  "bảo hiểm xã hội",
+  "BHYT",
+  "bảo hiểm y tế",
+  "BHTN",
+  "bảo hiểm thất nghiệp",
+  "bảo hiểm",
   "trợ cấp",
   "hưu trí",
+  "thai sản",
+  "nghỉ phép",
+  "lao động",
+  "hợp đồng lao động",
+  "Nghị định",
+  "Thông tư",
 ];
 
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 const MIN_INTERVAL_MS = 3000;
+// Kept tight so a hanging site fails fast instead of compounding across
+// retries (worst case with 2 retries + exponential backoff: ~33s per URL).
+const AXIOS_TIMEOUT_MS = 10_000;
 const lastRequestAtByDomain = new Map<string, number>();
 
 function sleep(ms: number): Promise<void> {
@@ -41,36 +74,50 @@ function getDomain(url: string): string {
   }
 }
 
-async function throttle(url: string): Promise<void> {
+async function throttle(url: string, minIntervalMs: number): Promise<void> {
   const domain = getDomain(url);
   const last = lastRequestAtByDomain.get(domain) ?? 0;
   const elapsed = Date.now() - last;
-  if (elapsed < MIN_INTERVAL_MS) {
-    await sleep(MIN_INTERVAL_MS - elapsed);
+  if (elapsed < minIntervalMs) {
+    await sleep(minIntervalMs - elapsed);
   }
   lastRequestAtByDomain.set(domain, Date.now());
 }
 
-/**
- * Fetch HTML with a browser-like User-Agent, 15s timeout, rate limiting
- * (max 1 req / 3s per domain), and up to `retries` retries on failure.
- */
-export async function fetchHTML(url: string, retries = 2): Promise<string> {
-  await throttle(url);
+async function fetchHTMLAttempt(
+  url: string,
+  minIntervalMs: number,
+  attempt: number,
+  maxRetries: number
+): Promise<string> {
+  await throttle(url, minIntervalMs);
   try {
     const { data } = await axios.get<string>(url, {
-      headers: { "User-Agent": USER_AGENT },
-      timeout: 15000,
+      headers: {
+        "User-Agent": USER_AGENT,
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
+      },
+      timeout: AXIOS_TIMEOUT_MS,
       responseType: "text",
     });
     return data;
   } catch (err) {
-    if (retries > 0) {
-      await sleep(1000);
-      return fetchHTML(url, retries - 1);
+    if (attempt < maxRetries) {
+      await sleep(1000 * 2 ** attempt); // exponential backoff: 1s, 2s, 4s...
+      return fetchHTMLAttempt(url, minIntervalMs, attempt + 1, maxRetries);
     }
     throw err;
   }
+}
+
+/**
+ * Fetch HTML with a browser-like User-Agent, 10s timeout, per-domain rate
+ * limiting (default 1 req / 3s, override via `minIntervalMs` for stricter
+ * gov sites), and up to `retries` retries with exponential backoff.
+ */
+export function fetchHTML(url: string, retries = 2, minIntervalMs = MIN_INTERVAL_MS): Promise<string> {
+  return fetchHTMLAttempt(url, minIntervalMs, 0, retries);
 }
 
 export function matchesCBKeywords(text: string): boolean {
@@ -103,6 +150,14 @@ export function extractDocIdHint(title: string): string | undefined {
     const prefix = stripDiacritics(numberPrefixOnly[2]).toUpperCase();
     const agency = stripDiacritics(numberPrefixOnly[3]).toUpperCase();
     return `${prefix}-${numberPrefixOnly[1]}-${agency}`;
+  }
+
+  // "Công văn" titles lead with the word instead of trailing the number
+  // (e.g. "Công văn số 1234/TCT-CS"), unlike NĐ/QĐ/TT.
+  const congVan = title.match(/Công văn\s*(?:số)?\s*(\d+)\/([A-ZĐ][A-ZĐ0-9-]*)/i);
+  if (congVan) {
+    const agency = stripDiacritics(congVan[2]).toUpperCase();
+    return `CV-${congVan[1]}-${agency}`;
   }
 
   return undefined;
@@ -175,4 +230,9 @@ export function resolveUrl(href: string, base: string): string {
   } catch {
     return href;
   }
+}
+
+/** True if a fetchHTML() rejection was a 403/429 anti-bot block rather than a network/parse issue. */
+export function isBlockedStatus(err: unknown): boolean {
+  return axios.isAxiosError(err) && (err.response?.status === 403 || err.response?.status === 429);
 }
